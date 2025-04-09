@@ -1,0 +1,433 @@
+---
+title: "Cloud Computing Project - Predicting Housing Prices"
+output: html_document
+date: "2025-03-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+
+```{r libraries}
+# Load required libraries
+library(tidyverse)  
+library(sf) 
+library(skimr)
+library(corrplot)
+library(GGally)
+library(hexbin)
+library(car)
+library(dplyr)
+library(ggplot2)
+library(hexbin)
+library(splines)
+
+```
+
+
+```{r set-working-directly}
+# =============================================================================
+# 2. Set Working Directory
+# =============================================================================
+setwd("/Users/macytrout/Desktop/cloud computing")
+
+
+```
+
+```{r import-data}
+# =============================================================================
+# 3. Import CSV & GeoJSON Files
+# =============================================================================
+
+# CSVs
+assessments_df            <- read_csv("assessments.csv")
+opa_properties_public2_df <- read_csv("opa_properties_public-2.csv")
+pwd_parcels_csv           <- read_csv("PWD_PARCELS-2.csv")
+pwd_parcels_sf            <- st_read("PWD_PARCELS.geojson")
+
+```
+
+
+```{r print-colunmns} 
+# =============================================================================
+# 4. Data Cleaning & Data Processing
+# =============================================================================
+
+pud <- opa_properties_public2_df  # use the public properties dataset
+options(scipen = 999)
+str(pud)
+
+pud <- pud %>%
+  mutate(
+    sale_date = as.Date(sale_date, format="%Y-%m-%d"),
+    sale_date = if_else(sale_date <= Sys.Date(), sale_date, NA_Date_),
+    sale_year = year(sale_date),
+    sale_month = month(sale_date),
+    sale_quarter = quarter(sale_date),
+    days_since_2000 = as.numeric(sale_date - as.Date("2000-01-01"))
+  ) %>%
+  filter(!is.na(sale_date))
+
+```
+
+
+```{r}
+
+# =============================================================================
+# 5. Initial Feature Selection
+# =============================================================================
+useful_features <- pud %>%
+  select(
+    objectid,
+    market_value,
+    total_livable_area,
+    total_area,
+    year_built,
+    number_of_bathrooms,
+    number_of_bedrooms,
+    number_stories,
+    garage_spaces,
+    exterior_condition,
+    interior_condition,
+    quality_grade,
+    geographic_ward,
+    zip_code,
+    census_tract,
+    location,
+    zoning,
+    category_code,
+    sale_price,
+    sale_date,
+    fireplaces
+  )
+
+```
+
+```{r}
+
+# =============================================================================
+# 6. Logical Filtering & Data Cleaning
+# =============================================================================
+cleaned_features <- useful_features %>%
+  filter(
+    number_of_bathrooms > 0 & number_of_bathrooms <= 7,
+    number_of_bedrooms > 0 & number_of_bedrooms <= 10,
+    number_stories > 0 & number_stories <= 5,
+    total_livable_area >= 300 & total_livable_area <= 6000,
+    total_area >= total_livable_area,
+    total_area <= 20000,
+    exterior_condition >= 1 & exterior_condition <= 7,
+    interior_condition >= 1 & interior_condition <= 7,
+    year_built >= 1700 & year_built <= 2023,
+    sale_price >= 10000 & sale_price <= 5000000,
+    market_value >= 10000 & market_value <= 5000000,
+    number_of_bathrooms <= number_of_bedrooms * 2
+  ) %>%
+  mutate(
+    quality_grade = case_when(
+      quality_grade == "X" ~ "Highest",
+      quality_grade %in% c("X-", "A+", "A", "A-") ~ "High",
+      quality_grade %in% c("C", "D", "D-", "D+", "6", "D-", "E", "C-", "E-", "E+") ~ "Lowest",
+      TRUE ~ "Mid"
+    )
+  )
+
+
+# =============================================================================
+# 7. Exclude Bundled Sales & Extreme Outliers
+# =============================================================================
+filtered_data <- cleaned_features %>% 
+  filter(sale_price > 1000)
+
+bundled_ids <- filtered_data %>%
+  group_by(sale_date, sale_price) %>%
+  filter(n() > 1) %>%
+  pull(objectid)
+
+filtered_data <- filtered_data %>% 
+  filter(!(objectid %in% bundled_ids))
+
+
+# =============================================================================
+# 8. Create Time-Based Feature (Recency)
+# =============================================================================
+filtered_data <- filtered_data %>%
+  mutate(
+    sale_year = year(sale_date),
+    current_year = 2023,
+    years_since_sale = current_year - sale_year
+  )
+
+
+```
+
+
+```{r}
+
+# =============================================================================
+# 9. Basic Feature Engineering
+# =============================================================================
+engineered_features <- filtered_data %>%
+  # Ensure condition variables are numeric
+  mutate(
+    exterior_condition = as.numeric(exterior_condition),
+    interior_condition = as.numeric(interior_condition)
+  ) %>%
+  mutate(
+    log_livable_area = log(total_livable_area),
+    log_total_area = log(total_area),
+    area_ratio = total_livable_area / total_area,
+    bathrooms_per_area = number_of_bathrooms / total_livable_area,
+    bedrooms_per_area = number_of_bedrooms / total_livable_area,
+    exterior_condition_reversed = 8 - exterior_condition,
+    interior_condition_reversed = 8 - interior_condition,
+    overall_condition = (exterior_condition_reversed + interior_condition_reversed) / 2,
+    building_age = current_year - year_built,
+    age_category = case_when(
+      building_age < 20 ~ "New",
+      building_age < 50 ~ "Modern",
+      building_age < 100 ~ "Vintage",
+      TRUE ~ "Historic"
+    ),
+    price_per_sqft = sale_price / total_livable_area,
+    zip_factor = as.factor(zip_code),
+    ward_factor = as.factor(geographic_ward)
+  )
+
+# =============================================================================
+# 10. Interaction Terms & Derived Variables
+# =============================================================================
+engineered_features <- engineered_features %>%
+  mutate(
+    area_zip_interaction = scale(log_livable_area) * as.numeric(as.factor(zip_code)),
+    condition_age_interaction = scale(overall_condition) * scale(building_age),
+    area_quality_interaction = scale(log_livable_area) * 
+      case_when(
+        quality_grade == "Highest" ~ 4,
+        quality_grade == "High" ~ 3,
+        quality_grade == "Mid" ~ 2,
+        TRUE ~ 1
+      ),
+    bath_bed_interaction = scale(number_of_bathrooms) * scale(number_of_bedrooms),
+    area_condition_interaction = scale(log_livable_area) * scale(overall_condition)
+  )
+
+# =============================================================================
+# 11. Final Feature Engineering Refinements
+# =============================================================================
+engineered_features <- engineered_features %>%
+  mutate(
+    quality_grade_simplified = case_when(
+      quality_grade %in% c("Highest", "High") ~ "High",
+      quality_grade == "Mid" ~ "Mid",
+      TRUE ~ "Low"
+    ),
+    quality_adjusted_area = total_livable_area * 
+      case_when(
+        quality_grade_simplified == "High" ~ 1.4,
+        quality_grade_simplified == "Mid" ~ 1.1,
+        TRUE ~ 1.0
+      ),
+    quality_condition_score = overall_condition * 
+      case_when(
+        quality_grade_simplified == "High" ~ 1.2,
+        quality_grade_simplified == "Mid" ~ 1.1,
+        TRUE ~ 1.0
+      )
+  )
+
+# Remove empty strings, NAs, and problematic numeric entries
+engineered_features <- engineered_features %>%
+  mutate(across(where(is.character), ~na_if(., ""))) %>%
+  filter(complete.cases(.)) %>%
+  filter(if_all(where(is.numeric), ~!is.nan(.) & !is.infinite(.)))
+
+
+```
+
+
+
+
+```{r}
+# =============================================================================
+# 12. Final Feature Selection for Modeling
+# =============================================================================
+# Instead of selecting only objectid and sale_price, include a set of predictors for modeling.
+final_data <- engineered_features %>%
+  select(
+    objectid,
+    sale_price,
+    log_livable_area,
+    number_of_bathrooms,
+    number_of_bedrooms,
+    fireplaces,
+    year_built,
+    years_since_sale,
+    building_age,
+    area_ratio,
+    price_per_sqft,
+    overall_condition,
+    quality_adjusted_area,
+    bath_bed_interaction
+  )
+
+str(final_data)
+
+# (Optional) Save the final dataset for future use
+write.csv(final_data, "cleaned_philadelphia_properties_for_modeling.csv", row.names = FALSE)
+
+
+
+```
+
+```{r}
+# =============================================================================
+# 13. Modeling
+# =============================================================================
+# Fit a linear model predicting log(sale_price) using the selected engineered features.
+model_sale <- lm(log(sale_price) ~ log_livable_area + number_of_bathrooms +
+                   number_of_bedrooms + fireplaces + year_built +
+                   years_since_sale + building_age + area_ratio + price_per_sqft +
+                   overall_condition + quality_adjusted_area + bath_bed_interaction, 
+                 data = final_data)
+summary(model_sale)
+
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+# =============================================================================
+# 14. Modeling Part 2 w/ Spline Transformation 
+# =============================================================================
+
+# this is a model with spline transformations on log_livable_area and year_built
+model_sale_spline <- lm(log(sale_price) ~ 
+                          ns(log_livable_area, df = 4) +    # spline on log_livable_area
+                          number_of_bathrooms + 
+                          number_of_bedrooms + 
+                          fireplaces + 
+                          ns(year_built, df = 4) +           # spline on year_built
+                          years_since_sale + 
+                          building_age + 
+                          area_ratio + 
+                          price_per_sqft +
+                          overall_condition + 
+                          quality_adjusted_area + 
+                          bath_bed_interaction, 
+                        data = final_data)
+
+summary(model_sale_spline)
+
+
+# Splines were used in this project to flexibly capture non-linear relationships between key predictors (like log_livable_area and year_built) and sale_price. This approach allows the model to adjust for curvature in the data without resorting to overly complex high-degree polynomials, thereby improving fit and predictive accuracy while maintaining interpretability.
+
+```
+
+
+# EDA Visualizations 
+
+```{r}
+
+# Histogram of sale_price
+ggplot(final_data, aes(x = sale_price)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  labs(title = "Distribution of Sale Price", x = "Sale Price", y = "Count") +
+  theme_minimal()
+
+# Histogram of log(sale_price)
+ggplot(final_data, aes(x = log(sale_price))) +
+  geom_histogram(bins = 50, fill = "darkgreen", color = "white") +
+  labs(title = "Distribution of Log(Sale Price)", x = "Log(Sale Price)", y = "Count") +
+  theme_minimal()
+
+# These histograms illustrate how the raw sale prices are heavily right‐skewed, with most properties clustered at lower price ranges and a long tail of high‐value sales. Once you apply a log transformation, the distribution becomes more symmetric and bell‐shaped, indicating that taking the logarithm helps normalize the data for better modeling and analysis.
+
+```
+
+
+
+```{r}
+# Scatterplot: Sale Price vs. Log(Livable Area)
+ggplot(final_data, aes(x = log_livable_area, y = sale_price)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = "Sale Price vs. Log(Livable Area)", x = "Log(Livable Area)", y = "Sale Price") +
+  theme_minimal()
+
+# Scatterplot: Log(Sale Price) vs. Log(Livable Area)
+ggplot(final_data, aes(x = log_livable_area, y = log(sale_price))) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = "Log(Sale Price) vs. Log(Livable Area)", x = "Log(Livable Area)", y = "Log(Sale Price)") +
+  theme_minimal()
+
+# Scatterplot: Sale Price vs. Year Built with loess smoother
+ggplot(final_data, aes(x = year_built, y = sale_price)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "loess", color = "blue") +
+  labs(title = "Sale Price vs. Year Built", x = "Year Built", y = "Sale Price") +
+  theme_minimal()
+
+
+
+```
+
+
+```{r, fig.width=12, fig.height=8, fig.align='center'}
+
+my_palette <- colorRampPalette(c("purple4", "blue4", "red4"))(100)
+
+
+num_vars <- final_data %>%
+  select(sale_price, log_livable_area, number_of_bathrooms, number_of_bedrooms,
+         fireplaces, year_built, years_since_sale, building_age, area_ratio,
+         price_per_sqft, overall_condition, quality_adjusted_area, bath_bed_interaction)
+
+
+corr_mat <- cor(num_vars, use = "complete.obs")
+
+
+corrplot(corr_mat, method = "number", type = "upper", 
+         tl.cex = 0.8, number.cex = 0.7,
+         col = my_palette,
+         title = "Correlation Matrix of Model Variables", 
+         mar = c(1, 1, 4, 1))
+
+# This correlation matrix displays the linear associations among key numeric variables. It shows that variables like log_livable_area and number_of_bathrooms tend to be strongly positively correlated with sale_price, while indicators such as building_age have an expected inverse relationship. This visualization helps identify potential redundancy among predictors and assess which factors most strongly influence property sale prices.
+
+```
+
+
+
+```{r}
+
+# Select numeric model variables
+num_vars <- final_data %>%
+  select(sale_price, log_livable_area, number_of_bathrooms, number_of_bedrooms,
+         fireplaces, year_built, years_since_sale, building_age, area_ratio,
+         price_per_sqft, overall_condition, quality_adjusted_area, bath_bed_interaction)
+
+# Make column names syntactically valid
+names(num_vars) <- make.names(names(num_vars))
+
+# Check names and rename if necessary:
+print(names(num_vars))
+# For example, if any column is named "X", rename it:
+names(num_vars)[names(num_vars) == "X"] <- "X_value"  # adjust as needed
+
+
+# Now create the pairwise plot
+library(GGally)
+ggpairs(num_vars, title = "Pairwise Scatterplot Matrix of Model Variables")
+
+```
