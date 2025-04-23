@@ -11,5 +11,5 @@ node_modules/
 # Data
 data/
 
-# Sensitive files
+# Service account credentials
 keys/
